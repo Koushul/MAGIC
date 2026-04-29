@@ -1,6 +1,5 @@
-use ndarray::{Array2, Axis};
+use ndarray::{s, Array2, Axis};
 use rayon::prelude::*;
-use sprs::CsMat;
 
 pub struct CsrF64 {
     pub data: Vec<f64>,
@@ -8,6 +7,21 @@ pub struct CsrF64 {
     pub indptr: Vec<i32>,
     pub nrows: usize,
     pub ncols: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct ImputeConfig {
+    pub threads: Option<usize>,
+    pub gene_block_size: usize,
+}
+
+impl Default for ImputeConfig {
+    fn default() -> Self {
+        Self {
+            threads: None,
+            gene_block_size: 128,
+        }
+    }
 }
 
 impl CsrF64 {
@@ -28,18 +42,7 @@ impl CsrF64 {
         }
     }
 
-    pub fn to_sprs_csr(&self) -> CsMat<f64> {
-        let indptr_u: Vec<usize> = self.indptr.iter().map(|&v| v as usize).collect();
-        let indices_u: Vec<usize> = self.indices.iter().map(|&v| v as usize).collect();
-        CsMat::new(
-            (self.nrows, self.ncols),
-            indptr_u,
-            indices_u,
-            self.data.clone(),
-        )
-    }
-
-    pub fn matmul_dense_rhs_parallel(
+    pub fn matmul_dense_rhs_legacy(
         &self,
         x: &Array2<f64>,
         nthreads: Option<usize>,
@@ -84,43 +87,137 @@ impl CsrF64 {
 
         out
     }
-}
 
-fn sparse_power_csr(mat: &CsMat<f64>, t: u32) -> CsMat<f64> {
-    assert_eq!(mat.rows(), mat.cols());
-    if t == 0 {
-        return CsMat::eye(mat.rows());
-    }
-    let mut acc = mat.clone();
-    for _ in 1..t {
-        acc = mat * &acc;
-    }
-    acc
-}
+    fn spmm_dense_blocked_into(
+        &self,
+        x: &Array2<f64>,
+        out: &mut Array2<f64>,
+        config: &ImputeConfig,
+    ) {
+        assert_eq!(x.nrows(), self.ncols);
+        assert_eq!(out.dim(), (self.nrows, x.ncols()));
 
-fn csr_dense_matmul(csr: &CsMat<f64>, x: &Array2<f64>) -> Array2<f64> {
-    let n = csr.rows();
-    let p = x.ncols();
-    assert_eq!(csr.cols(), x.nrows());
-    let mut out = Array2::<f64>::zeros((n, p));
-    for (i, row) in csr.outer_iterator().enumerate() {
-        for k in 0..p {
-            let mut s = 0.0f64;
-            for (j, val) in row.iter() {
-                s += *val * x[[j, k]];
-            }
-            out[[i, k]] = s;
+        let p = x.ncols();
+        let bs = config.gene_block_size.max(1);
+
+        for kc in (0..p).step_by(bs) {
+            let ke = (kc + bs).min(p);
+            let mut out_blk = out.slice_mut(s![.., kc..ke]);
+            let x_blk = x.slice(s![.., kc..ke]);
+            self.spmm_dense_block_f64(x_blk, &mut out_blk, config);
         }
     }
-    out
+
+    fn spmm_dense_block_f64(
+        &self,
+        x_blk: ndarray::ArrayView2<f64>,
+        out_blk: &mut ndarray::ArrayViewMut2<f64>,
+        config: &ImputeConfig,
+    ) {
+        let pool = config
+            .threads
+            .map(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().ok())
+            .flatten();
+
+        let row_fn = |i: usize, mut out_row: ndarray::ArrayViewMut1<f64>| {
+            let r0 = self.indptr[i] as usize;
+            let r1 = self.indptr[i + 1] as usize;
+            out_row.fill(0.0);
+            for ptr in r0..r1 {
+                let j = self.indices[ptr] as usize;
+                let w = self.data[ptr];
+                let x_row = x_blk.row(j);
+                for (oc, xc) in out_row.iter_mut().zip(x_row.iter()) {
+                    *oc += w * *xc;
+                }
+            }
+        };
+
+        if let Some(ref pool) = pool {
+            pool.install(|| {
+                out_blk
+                    .axis_iter_mut(Axis(0))
+                    .into_iter()
+                    .enumerate()
+                    .par_bridge()
+                    .for_each(|(i, row)| row_fn(i, row));
+            });
+        } else {
+            out_blk
+                .axis_iter_mut(Axis(0))
+                .into_iter()
+                .enumerate()
+                .par_bridge()
+                .for_each(|(i, row)| row_fn(i, row));
+        }
+    }
+
+    fn spmm_dense_blocked_into_f32(
+        &self,
+        x: &Array2<f32>,
+        out: &mut Array2<f32>,
+        config: &ImputeConfig,
+    ) {
+        assert_eq!(x.nrows(), self.ncols);
+        assert_eq!(out.dim(), (self.nrows, x.ncols()));
+
+        let p = x.ncols();
+        let bs = config.gene_block_size.max(1);
+
+        for kc in (0..p).step_by(bs) {
+            let ke = (kc + bs).min(p);
+            let mut out_blk = out.slice_mut(s![.., kc..ke]);
+            let x_blk = x.slice(s![.., kc..ke]);
+            self.spmm_dense_block_f32(x_blk, &mut out_blk, config);
+        }
+    }
+
+    fn spmm_dense_block_f32(
+        &self,
+        x_blk: ndarray::ArrayView2<f32>,
+        out_blk: &mut ndarray::ArrayViewMut2<f32>,
+        config: &ImputeConfig,
+    ) {
+        let pool = config
+            .threads
+            .map(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().ok())
+            .flatten();
+
+        let row_fn = |i: usize, mut out_row: ndarray::ArrayViewMut1<f32>| {
+            let r0 = self.indptr[i] as usize;
+            let r1 = self.indptr[i + 1] as usize;
+            out_row.fill(0.0);
+            for ptr in r0..r1 {
+                let j = self.indices[ptr] as usize;
+                let w = self.data[ptr] as f32;
+                let x_row = x_blk.row(j);
+                for (oc, xc) in out_row.iter_mut().zip(x_row.iter()) {
+                    *oc += w * *xc;
+                }
+            }
+        };
+
+        if let Some(ref pool) = pool {
+            pool.install(|| {
+                out_blk
+                    .axis_iter_mut(Axis(0))
+                    .into_iter()
+                    .enumerate()
+                    .par_bridge()
+                    .for_each(|(i, row)| row_fn(i, row));
+            });
+        } else {
+            out_blk
+                .axis_iter_mut(Axis(0))
+                .into_iter()
+                .enumerate()
+                .par_bridge()
+                .for_each(|(i, row)| row_fn(i, row));
+        }
+    }
 }
 
-pub fn impute_magic_exact(
-    diff_op: &CsrF64,
-    data: &Array2<f64>,
-    t: u32,
-    nthreads: Option<usize>,
-) -> Array2<f64> {
+pub fn impute_magic(diff_op: &CsrF64, data: &Array2<f64>, t: u32, config: &ImputeConfig) -> Array2<f64> {
     let n = diff_op.nrows;
     let p = data.ncols();
     assert_eq!(diff_op.ncols, n);
@@ -130,17 +227,81 @@ pub fn impute_magic_exact(
         return data.clone();
     }
 
-    if (t as usize) > 0 && n < p {
-        let d = diff_op.to_sprs_csr();
-        let d_t = sparse_power_csr(&d, t);
-        return csr_dense_matmul(&d_t, data);
+    let mut a = data.clone();
+    let mut b = Array2::<f64>::zeros((n, p));
+    let mut from_a = true;
+
+    for _ in 0..t {
+        if from_a {
+            diff_op.spmm_dense_blocked_into(&a, &mut b, config);
+        } else {
+            diff_op.spmm_dense_blocked_into(&b, &mut a, config);
+        }
+        from_a = !from_a;
+    }
+
+    if from_a {
+        a
+    } else {
+        b
+    }
+}
+
+pub fn impute_magic_f32(diff_op: &CsrF64, data: &Array2<f32>, t: u32, config: &ImputeConfig) -> Array2<f32> {
+    let n = diff_op.nrows;
+    let p = data.ncols();
+    assert_eq!(diff_op.ncols, n);
+    assert_eq!(data.nrows(), n);
+
+    if t == 0 {
+        return data.clone();
+    }
+
+    let mut a = data.clone();
+    let mut b = Array2::<f32>::zeros((n, p));
+    let mut from_a = true;
+
+    for _ in 0..t {
+        if from_a {
+            diff_op.spmm_dense_blocked_into_f32(&a, &mut b, config);
+        } else {
+            diff_op.spmm_dense_blocked_into_f32(&b, &mut a, config);
+        }
+        from_a = !from_a;
+    }
+
+    if from_a {
+        a
+    } else {
+        b
+    }
+}
+
+pub fn impute_magic_legacy(diff_op: &CsrF64, data: &Array2<f64>, t: u32, nthreads: Option<usize>) -> Array2<f64> {
+    let n = diff_op.nrows;
+    assert_eq!(diff_op.ncols, n);
+    assert_eq!(data.nrows(), n);
+
+    if t == 0 {
+        return data.clone();
     }
 
     let mut current = data.clone();
     for _ in 0..t {
-        current = diff_op.matmul_dense_rhs_parallel(&current, nthreads);
+        current = diff_op.matmul_dense_rhs_legacy(&current, nthreads);
     }
     current
+}
+
+pub fn impute_magic_exact(
+    diff_op: &CsrF64,
+    data: &Array2<f64>,
+    t: u32,
+    nthreads: Option<usize>,
+) -> Array2<f64> {
+    let mut cfg = ImputeConfig::default();
+    cfg.threads = nthreads;
+    impute_magic(diff_op, data, t, &cfg)
 }
 
 #[cfg(test)]
@@ -174,7 +335,11 @@ mod tests {
         let indptr = ptr_arr.into_raw_vec_and_offset().0;
 
         let csr = CsrF64::from_parts(data_f, indices, indptr, n, m);
-        let out = impute_magic_exact(&csr, &x, t, Some(1));
+        let cfg = ImputeConfig {
+            threads: Some(1),
+            gene_block_size: 64,
+        };
+        let out = impute_magic(&csr, &x, t, &cfg);
 
         let tol = 1e-9;
         assert_eq!(out.dim(), expected.dim());
@@ -184,40 +349,86 @@ mod tests {
     }
 
     #[test]
-    fn classic_matrix_power_matches_numpy_style() {
-        let n = 5usize;
-        let p = 20usize;
-        let mut tr = sprs::TriMat::new((n, n));
-        for i in 0..n {
-            let j = (i + 1) % n;
-            tr.add_triplet(i, j, 0.5_f64);
-            tr.add_triplet(i, i, 0.5_f64);
-        }
-        let d = tr.to_csr();
-        let csr = CsrF64::from_parts(
-            d.data().to_vec(),
-            d.indices().to_vec().into_iter().map(|x| x as i32).collect(),
-            d.indptr()
-                .raw_storage()
-                .to_vec()
-                .into_iter()
-                .map(|x: usize| x as i32)
-                .collect(),
-            n,
-            n,
-        );
-        let mut rng = Array2::<f64>::zeros((n, p));
+    fn blocked_matches_legacy_random() {
+        let n = 64usize;
+        let p = 97usize;
+        let csr = crate::testutil::small_stochastic_csr(n, 8, 99);
+        let mut x = Array2::<f64>::zeros((n, p));
         for i in 0..n {
             for j in 0..p {
-                rng[[i, j]] = (i + j) as f64 * 0.01 + 0.1;
+                x[[i, j]] = ((i * 31 + j * 7) % 100) as f64 * 0.01;
             }
         }
         let t = 4u32;
-        let via = impute_magic_exact(&csr, &rng, t, Some(1));
-        let d_t = sparse_power_csr(&csr.to_sprs_csr(), t);
-        let ref_mul = csr_dense_matmul(&d_t, &rng);
-        for (a, b) in via.iter().zip(ref_mul.iter()) {
-            assert_abs_diff_eq!(a, b, epsilon = 1e-10);
+        let leg = impute_magic_legacy(&csr, &x, t, Some(1));
+        let cfg = ImputeConfig {
+            threads: Some(1),
+            gene_block_size: 17,
+        };
+        let opt = impute_magic(&csr, &x, t, &cfg);
+        for (a, b) in leg.iter().zip(opt.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-12);
         }
+    }
+
+    #[test]
+    fn f32_near_f64_fixture() {
+        let dir = fixture_dir();
+        let x64: Array2<f64> = read_npy(dir.join("X.npy")).expect("X.npy");
+        let expected: Array2<f64> = read_npy(dir.join("X_magic.npy")).expect("X_magic.npy");
+        let meta: ndarray::Array1<i64> = read_npy(dir.join("meta.npy")).expect("meta");
+        let n = meta[0] as usize;
+        let m = meta[1] as usize;
+        let t = meta[4] as u32;
+
+        let data_arr: ndarray::Array1<f64> = read_npy(dir.join("diff_op_data.npy")).expect("parse data");
+        let ind_arr: ndarray::Array1<i32> = read_npy(dir.join("diff_op_indices.npy")).expect("parse ind");
+        let ptr_arr: ndarray::Array1<i32> = read_npy(dir.join("diff_op_indptr.npy")).expect("parse ptr");
+
+        let data_f = data_arr.into_raw_vec_and_offset().0;
+        let indices = ind_arr.into_raw_vec_and_offset().0;
+        let indptr = ptr_arr.into_raw_vec_and_offset().0;
+
+        let csr = CsrF64::from_parts(data_f, indices, indptr, n, m);
+        let x32 = x64.mapv(|v| v as f32);
+        let cfg = ImputeConfig {
+            threads: Some(1),
+            gene_block_size: 64,
+        };
+        let out32 = impute_magic_f32(&csr, &x32, t, &cfg);
+        let rtol = 1e-5f64;
+        let atol = 1e-6f64;
+        for (o, e) in out32.iter().zip(expected.iter()) {
+            assert!((*o as f64 - *e).abs() <= atol + rtol * e.abs());
+        }
+    }
+}
+
+#[cfg(test)]
+mod testutil {
+    use super::CsrF64;
+
+    pub fn small_stochastic_csr(n: usize, knn: usize, seed: u64) -> CsrF64 {
+        let mut indptr = vec![0i32; n + 1];
+        let mut indices = Vec::new();
+        let mut data = Vec::new();
+        let mut rng = seed;
+        for i in 0..n {
+            let row_start = data.len();
+            let mut row_sum = 0.0f64;
+            for _ in 0..knn {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let j = (rng as usize) % n;
+                let v = ((rng >> 32) as f64 / u32::MAX as f64) * 0.5 + 0.1;
+                indices.push(j as i32);
+                data.push(v);
+                row_sum += v;
+            }
+            for p in row_start..data.len() {
+                data[p] /= row_sum;
+            }
+            indptr[i + 1] = data.len() as i32;
+        }
+        CsrF64::from_parts(data, indices, indptr, n, n)
     }
 }

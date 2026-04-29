@@ -8,7 +8,10 @@ license = "GPL-2.0-or-later"
 [dependencies]
 ndarray = "0.16"
 rayon = "1.10"
-sprs = "0.11"
+
+[[bin]]
+name = "compare_magic_timings"
+path = "src/bin/compare_magic_timings.rs"
 
 [dev-dependencies]
 approx = "0.5"
