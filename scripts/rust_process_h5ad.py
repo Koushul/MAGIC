@@ -42,6 +42,7 @@ except ImportError as e:
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_RUST_LEIDEN_RESOLUTION_SCALE = 0.0019073486
 
 
 def find_magic_cli() -> Path | None:
@@ -328,14 +329,17 @@ def ensure_cell_type(adata: ad.AnnData, args, benchmark: dict | None = None) -> 
     t0 = time.perf_counter()
     if args.use_rust_leiden and not args.python_leiden_only:
         cli = find_leiden_cli() or build_leiden_cli()
+        resolution = (
+            args.rust_leiden_resolution
+            if args.rust_leiden_resolution is not None
+            else args.leiden_resolution * DEFAULT_RUST_LEIDEN_RESOLUTION_SCALE
+        )
         with tempfile.TemporaryDirectory() as tmp:
             labels = run_rust_leiden(
                 cli,
                 work.obsp["connectivities"].tocsr(),
                 Path(tmp) / "labels.npy",
-                resolution=args.rust_leiden_resolution
-                if args.rust_leiden_resolution is not None
-                else args.leiden_resolution,
+                resolution=resolution,
                 randomness=args.leiden_randomness,
                 seed=args.random_state,
                 max_iter=args.leiden_max_iter,
@@ -548,7 +552,7 @@ def main():
         "--rust-leiden-resolution",
         type=float,
         default=None,
-        help="Override CPM resolution for Rust Leiden; defaults to --leiden-resolution",
+        help="Override CPM resolution for Rust Leiden; defaults to a scaled --leiden-resolution",
     )
     ap.add_argument("--leiden-randomness", type=float, default=0.01)
     ap.add_argument("--leiden-max-iter", type=int, default=100)

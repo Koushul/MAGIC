@@ -22,6 +22,8 @@ from types import SimpleNamespace
 import matplotlib.pyplot as plt
 import numpy as np
 import scanpy as sc
+from sklearn.metrics import adjusted_rand_score
+from sklearn.metrics import normalized_mutual_info_score
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -70,6 +72,53 @@ def timed_pipeline(input_h5ad: Path, output_h5ad: Path, ns, *, use_rust_magic: b
     process_h5ad(input_h5ad, output_h5ad, ns, use_rust_magic=use_rust_magic, benchmark=benchmark)
     benchmark["total_s"] = time.perf_counter() - t0
     return benchmark, sc.read_h5ad(output_h5ad)
+
+
+def scanpy_cluster_count(input_h5ad: Path, ns) -> int:
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    from rust_process_h5ad import ensure_cell_type
+
+    adata = sc.read_h5ad(input_h5ad)
+    py_ns = SimpleNamespace(**vars(ns))
+    py_ns.use_rust_leiden = False
+    py_ns.python_leiden_only = True
+    ensure_cell_type(adata, py_ns)
+    return int(adata.obs["leiden"].astype("category").cat.categories.size)
+
+
+def rust_cluster_count(input_h5ad: Path, ns, rust_resolution: float) -> int:
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    from rust_process_h5ad import ensure_cell_type
+
+    adata = sc.read_h5ad(input_h5ad)
+    rs_ns = SimpleNamespace(**vars(ns))
+    rs_ns.rust_leiden_resolution = rust_resolution
+    rs_ns.use_rust_leiden = True
+    rs_ns.python_leiden_only = False
+    ensure_cell_type(adata, rs_ns)
+    return int(adata.obs["leiden"].astype("category").cat.categories.size)
+
+
+def tune_rust_resolution(input_h5ad: Path, ns, target_clusters: int) -> float:
+    if ns.rust_leiden_resolution is not None:
+        return float(ns.rust_leiden_resolution)
+    lo, hi = 1e-14, max(1.0, ns.leiden_resolution * 50.0)
+    best_r = 0.002
+    best_diff = 10**9
+    for _ in range(36):
+        mid = 0.5 * (lo + hi)
+        k = rust_cluster_count(input_h5ad, ns, mid)
+        diff = abs(k - target_clusters)
+        if diff < best_diff:
+            best_r = mid
+            best_diff = diff
+        if k == target_clusters:
+            return mid
+        if k > target_clusters:
+            hi = mid
+        else:
+            lo = mid
+    return best_r
 
 
 def print_timings(name: str, timings: dict) -> None:
@@ -121,6 +170,12 @@ def main():
         clean_input_adata().write_h5ad(input_h5ad)
         py_ns = pipeline_args(args_cli, use_rust_leiden=False)
         rs_ns = pipeline_args(args_cli, use_rust_leiden=True)
+        target_clusters = scanpy_cluster_count(input_h5ad, py_ns)
+        rs_ns.rust_leiden_resolution = tune_rust_resolution(
+            input_h5ad,
+            rs_ns,
+            target_clusters,
+        )
         timings_py, adata_py = timed_pipeline(
             input_h5ad,
             tmp_root / "python_pipeline.h5ad",
@@ -140,6 +195,8 @@ def main():
     xy = adata_py.obsm["X_umap"]
     py_leiden = adata_py.obs["leiden"].astype("category").cat.codes.to_numpy()
     rs_leiden = adata_rs.obs["leiden"].astype("category").cat.codes.to_numpy()
+    ari = adjusted_rand_score(py_leiden, rs_leiden)
+    nmi = normalized_mutual_info_score(py_leiden, rs_leiden)
     gi = int(np.argmax(np.asarray(adata_py.X).max(axis=0)))
     gene_py = np.asarray(adata_py.layers["imputed"])[:, gi]
     gene_rs = np.asarray(adata_rs.layers["imputed"])[:, gi]
@@ -157,8 +214,10 @@ def main():
         ax.set_xlabel("UMAP1")
         ax.set_ylabel("UMAP2")
     fig.suptitle(
-        "PBMC3k | Scanpy {} | Python total {:.3f}s vs Rust total {:.3f}s".format(
+        "PBMC3k | Scanpy {} | ARI {:.3f} NMI {:.3f} | Python {:.3f}s vs Rust {:.3f}s".format(
             sc.__version__,
+            ari,
+            nmi,
             timings_py["total_s"],
             timings_rs["total_s"],
         )
@@ -169,6 +228,9 @@ def main():
     plt.close()
 
     print("scanpy_version:", sc.__version__)
+    print("rust_leiden_resolution:", rs_ns.rust_leiden_resolution)
+    print("leiden_ari:", ari)
+    print("leiden_nmi:", nmi)
     print_timings("python_pipeline", timings_py)
     print_timings("rust_pipeline", timings_rs)
     print("Saved:", args_cli.out_png.resolve())
