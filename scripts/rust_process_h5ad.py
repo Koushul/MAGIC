@@ -365,6 +365,10 @@ def _cluster_magic_params(x_ls: np.ndarray, args_ns: SimpleNamespace) -> SimpleN
     return SimpleNamespace(magic_knn=knn, magic_knn_max=knn_max, magic_n_pca=n_pca)
 
 
+def _count_layer_from_cell_codes(codes: np.ndarray, n_vars: int) -> np.ndarray:
+    return np.repeat(codes.reshape(-1, 1).astype(np.int32), n_vars, axis=1)
+
+
 def _python_magic_cluster(
     i: int,
     idx: np.ndarray,
@@ -447,7 +451,8 @@ def process_h5ad(
 
     if "imputation_count" in adata.layers:
         print("layers['imputation_count'] present — skipping MAGIC imputation.")
-        adata.layers["imputed_count"] = np.zeros((adata.n_obs, 1), dtype=np.int32)
+        zeros = np.zeros(adata.n_obs, dtype=np.int32)
+        adata.layers["imputed_count"] = _count_layer_from_cell_codes(zeros, adata.n_vars)
         adata.write_h5ad(path_out)
         return
 
@@ -527,7 +532,7 @@ def process_h5ad(
                 counts[idx] = i + 1
 
     adata.layers["imputed"] = out_imp
-    adata.layers["imputed_count"] = counts.reshape(-1, 1)
+    adata.layers["imputed_count"] = _count_layer_from_cell_codes(counts, adata.n_vars)
 
     adata.write_h5ad(path_out)
 
