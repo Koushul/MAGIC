@@ -31,3 +31,10 @@ matlab/EMT.csv
 *~
 ~$*
 .DS_Store
+
+# Rust
+rust/target
+
+# Large local AnnData snapshots (not tracked)
+data/*.h5ad
+rust/data/*.h5ad
