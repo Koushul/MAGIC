@@ -1,6 +1,8 @@
 use ndarray::{s, Array2, Axis};
 use rayon::prelude::*;
 
+pub mod synthetic;
+
 pub struct CsrF64 {
     pub data: Vec<f64>,
     pub indices: Vec<i32>,
@@ -352,7 +354,7 @@ mod tests {
     fn blocked_matches_legacy_random() {
         let n = 64usize;
         let p = 97usize;
-        let csr = crate::testutil::small_stochastic_csr(n, 8, 99);
+        let csr = crate::synthetic::csr_row_stochastic(n, 8, 99);
         let mut x = Array2::<f64>::zeros((n, p));
         for i in 0..n {
             for j in 0..p {
@@ -401,34 +403,5 @@ mod tests {
         for (o, e) in out32.iter().zip(expected.iter()) {
             assert!((*o as f64 - *e).abs() <= atol + rtol * e.abs());
         }
-    }
-}
-
-#[cfg(test)]
-mod testutil {
-    use super::CsrF64;
-
-    pub fn small_stochastic_csr(n: usize, knn: usize, seed: u64) -> CsrF64 {
-        let mut indptr = vec![0i32; n + 1];
-        let mut indices = Vec::new();
-        let mut data = Vec::new();
-        let mut rng = seed;
-        for i in 0..n {
-            let row_start = data.len();
-            let mut row_sum = 0.0f64;
-            for _ in 0..knn {
-                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-                let j = (rng as usize) % n;
-                let v = ((rng >> 32) as f64 / u32::MAX as f64) * 0.5 + 0.1;
-                indices.push(j as i32);
-                data.push(v);
-                row_sum += v;
-            }
-            for p in row_start..data.len() {
-                data[p] /= row_sum;
-            }
-            indptr[i + 1] = data.len() as i32;
-        }
-        CsrF64::from_parts(data, indices, indptr, n, n)
     }
 }

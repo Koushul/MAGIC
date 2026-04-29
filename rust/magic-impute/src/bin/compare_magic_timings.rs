@@ -3,46 +3,9 @@
 //! Usage:
 //!   cargo run --release -p magic-impute --bin compare_magic_timings -- --help
 
-use magic_impute::{impute_magic, impute_magic_f32, impute_magic_legacy, CsrF64, ImputeConfig};
-use ndarray::Array2;
+use magic_impute::{impute_magic, impute_magic_f32, impute_magic_legacy, synthetic, ImputeConfig};
 use std::process::Command;
 use std::time::Instant;
-
-fn synthetic_csr(n: usize, knn: usize, seed: u64) -> CsrF64 {
-    let mut indptr = vec![0i32; n + 1];
-    let mut indices = Vec::new();
-    let mut data = Vec::new();
-    let mut rng = seed;
-    for i in 0..n {
-        let row_start = data.len();
-        let mut row_sum = 0.0f64;
-        for _ in 0..knn {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let j = (rng as usize) % n;
-            let v = ((rng >> 32) as f64 / u32::MAX as f64) * 0.5 + 0.1;
-            indices.push(j as i32);
-            data.push(v);
-            row_sum += v;
-        }
-        for p in row_start..data.len() {
-            data[p] /= row_sum;
-        }
-        indptr[i + 1] = data.len() as i32;
-    }
-    CsrF64::from_parts(data, indices, indptr, n, n)
-}
-
-fn synthetic_x(n: usize, p: usize, seed: u64) -> Array2<f64> {
-    let mut x = Array2::<f64>::zeros((n, p));
-    let mut s = seed;
-    for i in 0..n {
-        for j in 0..p {
-            s = s.wrapping_mul(1103515245).wrapping_add(12345);
-            x[[i, j]] = (s as f64 / u64::MAX as f64) * 10.0;
-        }
-    }
-    x
-}
 
 fn median_sorted(v: &mut [f64]) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -112,8 +75,8 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(128usize);
 
-    let csr = synthetic_csr(n, knn, 42);
-    let x = synthetic_x(n, p, 1);
+    let csr = synthetic::csr_row_stochastic(n, knn, 42);
+    let x = synthetic::dense_expression(n, p, 1);
 
     let cfg = ImputeConfig {
         threads: Some(threads),

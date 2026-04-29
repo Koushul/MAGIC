@@ -13,6 +13,10 @@ rayon = "1.10"
 name = "compare_magic_timings"
 path = "src/bin/compare_magic_timings.rs"
 
+[[bin]]
+name = "scale_rust"
+path = "src/bin/scale_rust.rs"
+
 [dev-dependencies]
 approx = "0.5"
 ndarray-npy = "0.9"
