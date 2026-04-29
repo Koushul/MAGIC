@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Benchmark Scanpy (MAGIC Python imputation) vs Rust imputation on pbmc3k_processed.
+Benchmark the h5ad pipeline in Scanpy/Python mode versus Rust-assisted mode.
 
-Steps timed:
-  - preprocess + neighbors + leiden
-  - per Leiden cluster: full Python fit_transform vs fit (graph) + Rust magic-impute-cli
+Both runs use ``scripts/rust_process_h5ad.py`` on the same h5ad input with
+``obs['cell_type']``, ``obs['leiden']``, and ``layers['imputed_count']`` removed,
+forcing the full preprocess → neighbors → Leiden proxy → per-cluster MAGIC path.
 
 Outputs docs/figures/pipeline_scanpy_vs_rust_umap.png
 """
@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -23,9 +22,71 @@ from types import SimpleNamespace
 import matplotlib.pyplot as plt
 import numpy as np
 import scanpy as sc
-from scipy import sparse as sp
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def pipeline_args(args_cli, *, use_rust_leiden: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        neighbors=args_cli.neighbors,
+        leiden_resolution=args_cli.leiden_resolution,
+        rust_leiden_resolution=args_cli.rust_leiden_resolution,
+        leiden_randomness=args_cli.leiden_randomness,
+        leiden_max_iter=args_cli.leiden_max_iter,
+        hvg=args_cli.hvg,
+        n_top_hvg=args_cli.n_top_hvg,
+        magic_knn=args_cli.magic_knn,
+        magic_knn_max=args_cli.magic_knn_max,
+        magic_decay=args_cli.magic_decay,
+        magic_n_pca=args_cli.magic_n_pca,
+        magic_t=args_cli.magic_t,
+        random_state=args_cli.random_state,
+        magic_n_jobs=args_cli.magic_n_jobs,
+        threads=args_cli.threads,
+        cluster_workers=args_cli.cluster_workers,
+        block=args_cli.block,
+        use_rust_leiden=use_rust_leiden,
+        python_leiden_only=not use_rust_leiden,
+    )
+
+
+def clean_input_adata():
+    adata = sc.datasets.pbmc3k_processed().copy()
+    for col in ("cell_type", "leiden"):
+        if col in adata.obs.columns:
+            del adata.obs[col]
+    for layer in ("imputed", "imputed_count", "imputation_count"):
+        if layer in adata.layers:
+            del adata.layers[layer]
+    return adata
+
+
+def timed_pipeline(input_h5ad: Path, output_h5ad: Path, ns, *, use_rust_magic: bool):
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    from rust_process_h5ad import process_h5ad
+
+    benchmark = {}
+    t0 = time.perf_counter()
+    process_h5ad(input_h5ad, output_h5ad, ns, use_rust_magic=use_rust_magic, benchmark=benchmark)
+    benchmark["total_s"] = time.perf_counter() - t0
+    return benchmark, sc.read_h5ad(output_h5ad)
+
+
+def print_timings(name: str, timings: dict) -> None:
+    print(f"{name}:")
+    for key in (
+        "cell_type_source",
+        "n_leiden_clusters",
+        "leiden_preprocess_s",
+        "neighbors_s",
+        "leiden_scanpy_s",
+        "leiden_rust_s",
+        "ensure_cell_type_s",
+        "magic_total_s",
+        "total_s",
+    ):
+        if key in timings:
+            print(f"  {key}: {timings[key]}")
 
 
 def main():
@@ -36,147 +97,70 @@ def main():
         default=REPO_ROOT / "docs" / "figures" / "pipeline_scanpy_vs_rust_umap.png",
     )
     ap.add_argument("--threads", type=int, default=os.cpu_count() or 8)
+    ap.add_argument("--neighbors", type=int, default=15)
+    ap.add_argument("--leiden-resolution", type=float, default=1.0)
+    ap.add_argument("--rust-leiden-resolution", type=float, default=None)
+    ap.add_argument("--leiden-randomness", type=float, default=0.01)
+    ap.add_argument("--leiden-max-iter", type=int, default=100)
+    ap.add_argument("--hvg", action="store_true")
+    ap.add_argument("--n-top-hvg", type=int, default=2000)
+    ap.add_argument("--magic-knn", type=int, default=10)
+    ap.add_argument("--magic-knn-max", type=int, default=None)
+    ap.add_argument("--magic-decay", type=int, default=20)
+    ap.add_argument("--magic-n-pca", type=int, default=100)
     ap.add_argument("--magic-t", type=int, default=3)
+    ap.add_argument("--random-state", type=int, default=42)
+    ap.add_argument("--magic-n-jobs", type=int, default=1)
+    ap.add_argument("--cluster-workers", type=int, default=None)
+    ap.add_argument("--block", type=int, default=128)
     args_cli = ap.parse_args()
-
-    import magic
-    import scprep
-
-    sys.path.insert(0, str(REPO_ROOT / "scripts"))
-    from rust_process_h5ad import find_magic_cli, fit_magic_python, fit_magic_rust_from_python_graph, prepare_magic_matrix
-
-    adata = sc.datasets.pbmc3k_processed().copy()
-    for col in ("cell_type", "leiden"):
-        if col in adata.obs.columns:
-            del adata.obs[col]
-
-    times_py = {}
-    t0 = time.perf_counter()
-    x = adata.X
-    if sp.issparse(x):
-        mx = float(np.asarray(x.data).max()) if x.nnz else 0.0
-    else:
-        mx = float(np.asarray(x).max())
-    if mx > 50:
-        sc.pp.normalize_total(adata, target_sum=1e4)
-        sc.pp.log1p(adata)
-    sc.pp.neighbors(adata, n_neighbors=15)
-    sc.tl.leiden(adata, resolution=1.0, key_added="leiden")
-    times_py["clustering_s"] = time.perf_counter() - t0
-
-    categories = list(adata.obs["leiden"].astype("category").cat.categories)
-    x_den = adata.X.toarray() if sp.issparse(adata.X) else np.asarray(adata.X)
-
-    magic_py_total = 0.0
-    magic_graph_total = 0.0
-    magic_rust_impute_total = 0.0
-
-    cli = find_magic_cli()
-    if cli is None:
-        subprocess.run(
-            ["cargo", "build", "--release", "-p", "magic-impute", "--bin", "magic-impute-cli"],
-            cwd=REPO_ROOT / "rust",
-            check=True,
-        )
-        cli = find_magic_cli()
-
-    ns = SimpleNamespace(
-        magic_knn=10,
-        magic_knn_max=None,
-        magic_decay=20,
-        magic_n_pca=100,
-        magic_t=args_cli.magic_t,
-        random_state=42,
-        magic_n_jobs=1,
-        threads=args_cli.threads,
-        block=128,
-    )
-
-    out_py = np.zeros_like(x_den, dtype=np.float64)
-    out_rs = np.zeros_like(x_den, dtype=np.float64)
 
     with tempfile.TemporaryDirectory() as tmp_root:
         tmp_root = Path(tmp_root)
-        for i, ct in enumerate(categories):
-            mask = (adata.obs["leiden"] == ct).to_numpy()
-            idx = np.nonzero(mask)[0]
-            if idx.size == 0:
-                continue
-            sub_x = x_den[idx]
-            x_ls = prepare_magic_matrix(sub_x)
+        input_h5ad = tmp_root / "input.h5ad"
+        clean_input_adata().write_h5ad(input_h5ad)
+        py_ns = pipeline_args(args_cli, use_rust_leiden=False)
+        rs_ns = pipeline_args(args_cli, use_rust_leiden=True)
+        timings_py, adata_py = timed_pipeline(
+            input_h5ad,
+            tmp_root / "python_pipeline.h5ad",
+            py_ns,
+            use_rust_magic=False,
+        )
+        timings_rs, adata_rs = timed_pipeline(
+            input_h5ad,
+            tmp_root / "rust_pipeline.h5ad",
+            rs_ns,
+            use_rust_magic=True,
+        )
 
-            t0 = time.perf_counter()
-            imp_py = fit_magic_python(
-                x_ls,
-                knn=ns.magic_knn,
-                knn_max=ns.magic_knn_max,
-                decay=ns.magic_decay,
-                n_pca=ns.magic_n_pca,
-                t=ns.magic_t,
-                random_state=ns.random_state,
-                n_jobs=ns.magic_n_jobs,
-            )
-            magic_py_total += time.perf_counter() - t0
+    timings_py["magic_total_s"] = float(sum(timings_py.get("magic_cluster_times", [])))
+    timings_rs["magic_total_s"] = float(sum(timings_rs.get("magic_cluster_times", [])))
 
-            op = magic.MAGIC(
-                knn=ns.magic_knn,
-                knn_max=ns.magic_knn_max,
-                decay=ns.magic_decay,
-                t=ns.magic_t,
-                n_pca=ns.magic_n_pca,
-                random_state=ns.random_state,
-                n_jobs=ns.magic_n_jobs,
-                verbose=False,
-            )
-            t0 = time.perf_counter()
-            op.fit(x_ls)
-            magic_graph_total += time.perf_counter() - t0
-
-            t0 = time.perf_counter()
-            imp_rs = fit_magic_rust_from_python_graph(
-                x_ls,
-                knn=ns.magic_knn,
-                knn_max=ns.magic_knn_max,
-                decay=ns.magic_decay,
-                n_pca=ns.magic_n_pca,
-                t=ns.magic_t,
-                random_state=ns.random_state,
-                n_jobs=ns.magic_n_jobs,
-                threads_rust=ns.threads,
-                block=ns.block,
-                tmpdir=tmp_root / f"c{i}",
-                cli=cli,
-            )
-            magic_rust_impute_total += time.perf_counter() - t0
-
-            out_py[idx] = imp_py
-            out_rs[idx] = imp_rs
-
-    gi = int(np.argmax(np.asarray(x_den).max(axis=0)))
-    gene_py = out_py[:, gi]
-    gene_rs = out_rs[:, gi]
-
-    xy = adata.obsm["X_umap"]
-    leid_codes = adata.obs["leiden"].astype("category").cat.codes
+    xy = adata_py.obsm["X_umap"]
+    py_leiden = adata_py.obs["leiden"].astype("category").cat.codes.to_numpy()
+    rs_leiden = adata_rs.obs["leiden"].astype("category").cat.codes.to_numpy()
+    gi = int(np.argmax(np.asarray(adata_py.X).max(axis=0)))
+    gene_py = np.asarray(adata_py.layers["imputed"])[:, gi]
+    gene_rs = np.asarray(adata_rs.layers["imputed"])[:, gi]
 
     fig, axes = plt.subplots(2, 2, figsize=(11, 10), dpi=150)
-    axes[0, 0].scatter(xy[:, 0], xy[:, 1], c=leid_codes, s=3, cmap="tab20", rasterized=True)
-    axes[0, 0].set_title("Leiden")
-    axes[0, 1].scatter(xy[:, 0], xy[:, 1], c=leid_codes, s=3, cmap="tab20", rasterized=True)
-    axes[0, 1].set_title("Leiden (duplicate)")
+    axes[0, 0].scatter(xy[:, 0], xy[:, 1], c=py_leiden, s=3, cmap="tab20", rasterized=True)
+    axes[0, 0].set_title("Scanpy Leiden")
+    axes[0, 1].scatter(xy[:, 0], xy[:, 1], c=rs_leiden, s=3, cmap="tab20", rasterized=True)
+    axes[0, 1].set_title("Rust Leiden")
     axes[1, 0].scatter(xy[:, 0], xy[:, 1], c=gene_py, s=3, cmap="viridis", rasterized=True)
-    axes[1, 0].set_title("MAGIC Python")
+    axes[1, 0].set_title("Python MAGIC")
     axes[1, 1].scatter(xy[:, 0], xy[:, 1], c=gene_rs, s=3, cmap="viridis", rasterized=True)
-    axes[1, 1].set_title("MAGIC Rust SPMM")
+    axes[1, 1].set_title("Rust MAGIC SPMM")
     for ax in axes.flat:
         ax.set_xlabel("UMAP1")
         ax.set_ylabel("UMAP2")
     fig.suptitle(
-        "PBMC3k | clustering {:.3f}s | Python MAGIC {:.3f}s | graph {:.3f}s + Rust {:.3f}s".format(
-            times_py["clustering_s"],
-            magic_py_total,
-            magic_graph_total,
-            magic_rust_impute_total,
+        "PBMC3k | Scanpy {} | Python total {:.3f}s vs Rust total {:.3f}s".format(
+            sc.__version__,
+            timings_py["total_s"],
+            timings_rs["total_s"],
         )
     )
     plt.tight_layout()
@@ -184,11 +168,9 @@ def main():
     fig.savefig(args_cli.out_png)
     plt.close()
 
-    print("scanpy:", sc.__version__)
-    print("clustering_s:", times_py["clustering_s"])
-    print("magic_python_fit_transform_total_s:", magic_py_total)
-    print("magic_python_graph_fit_total_s:", magic_graph_total)
-    print("magic_rust_spmm_total_s:", magic_rust_impute_total)
+    print("scanpy_version:", sc.__version__)
+    print_timings("python_pipeline", timings_py)
+    print_timings("rust_pipeline", timings_rs)
     print("Saved:", args_cli.out_png.resolve())
 
 
