@@ -356,6 +356,15 @@ def ensure_cell_type(adata: ad.AnnData, args, benchmark: dict | None = None) -> 
     adata.obs["cell_type"] = adata.obs["leiden"].astype(str).astype("category")
 
 
+def _cluster_magic_params(x_ls: np.ndarray, args_ns: SimpleNamespace) -> SimpleNamespace:
+    n_cells, n_genes = x_ls.shape
+    knn = max(1, min(args_ns.magic_knn, n_cells - 2))
+    requested_knn_max = args_ns.magic_knn_max if args_ns.magic_knn_max is not None else 3 * knn
+    knn_max = max(knn, min(requested_knn_max, n_cells - 1))
+    n_pca = min(args_ns.magic_n_pca, n_cells - 1, n_genes)
+    return SimpleNamespace(magic_knn=knn, magic_knn_max=knn_max, magic_n_pca=n_pca)
+
+
 def _python_magic_cluster(
     i: int,
     idx: np.ndarray,
@@ -365,12 +374,16 @@ def _python_magic_cluster(
     collect_timing: bool,
 ):
     t0 = time.perf_counter() if collect_timing else 0.0
+    if x_ls.shape[0] < 3:
+        dt = time.perf_counter() - t0 if collect_timing else None
+        return i, idx, x_ls, dt
+    params = _cluster_magic_params(x_ls, args_ns)
     imp = fit_magic_python(
         x_ls,
-        knn=args_ns.magic_knn,
-        knn_max=args_ns.magic_knn_max,
+        knn=params.magic_knn,
+        knn_max=params.magic_knn_max,
         decay=args_ns.magic_decay,
-        n_pca=args_ns.magic_n_pca,
+        n_pca=params.magic_n_pca,
         t=args_ns.magic_t,
         random_state=args_ns.random_state,
         n_jobs=args_ns.magic_n_jobs,
@@ -390,12 +403,16 @@ def _rust_magic_cluster(
     collect_timing: bool,
 ):
     t0 = time.perf_counter() if collect_timing else 0.0
+    if x_ls.shape[0] < 3:
+        dt = time.perf_counter() - t0 if collect_timing else None
+        return i, idx, x_ls, dt
+    params = _cluster_magic_params(x_ls, args_ns)
     imp = fit_magic_rust_from_python_graph(
         x_ls,
-        knn=args_ns.magic_knn,
-        knn_max=args_ns.magic_knn_max,
+        knn=params.magic_knn,
+        knn_max=params.magic_knn_max,
         decay=args_ns.magic_decay,
-        n_pca=args_ns.magic_n_pca,
+        n_pca=params.magic_n_pca,
         t=args_ns.magic_t,
         random_state=args_ns.random_state,
         n_jobs=args_ns.magic_n_jobs,
