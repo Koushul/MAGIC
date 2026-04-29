@@ -49,15 +49,17 @@ def csr_upper_triangle(conn: sp.csr_matrix) -> sp.csr_matrix:
 
 def run_rust_leiden(
     exe: Path,
-    indptr: np.ndarray,
-    indices: np.ndarray,
-    data: np.ndarray,
+    indptr: Path,
+    indices: Path,
+    data: Path,
     n_nodes: int,
     resolution: float,
     randomness: float,
     seed: int,
     max_iter: int,
-    labels_out: Path,
+    labels_out: Path | None,
+    *,
+    probe_count_only: bool = False,
 ) -> None:
     cmd = [
         str(exe),
@@ -77,10 +79,47 @@ def run_rust_leiden(
         str(seed),
         "--max-iter",
         str(max_iter),
-        "--out-labels",
-        str(labels_out),
     ]
+    if probe_count_only:
+        cmd.append("--probe-count-only")
+    else:
+        cmd.extend(["--out-labels", str(labels_out)])
     subprocess.run(cmd, check=True, capture_output=True)
+
+
+def rust_cluster_count(
+    exe: Path,
+    td: Path,
+    n_nodes: int,
+    resolution: float,
+    randomness: float,
+    seed: int,
+    max_iter: int,
+) -> int:
+    out = subprocess.check_output(
+        [
+            str(exe),
+            "--indptr",
+            str(td / "indptr.npy"),
+            "--indices",
+            str(td / "indices.npy"),
+            "--data",
+            str(td / "data.npy"),
+            "--shape",
+            str(n_nodes),
+            "--resolution",
+            str(resolution),
+            "--randomness",
+            str(randomness),
+            "--seed",
+            str(seed),
+            "--max-iter",
+            str(max_iter),
+            "--probe-count-only",
+        ],
+        text=True,
+    )
+    return int(out.strip())
 
 
 def count_clusters_from_rust(
@@ -92,21 +131,7 @@ def count_clusters_from_rust(
     seed: int,
     max_iter: int,
 ) -> int:
-    lab = td / "probe_labels.npy"
-    run_rust_leiden(
-        exe,
-        td / "indptr.npy",
-        td / "indices.npy",
-        td / "data.npy",
-        n_nodes,
-        resolution,
-        randomness,
-        seed,
-        max_iter,
-        lab,
-    )
-    y = np.load(lab)
-    return int(len(np.unique(y)))
+    return rust_cluster_count(exe, td, n_nodes, resolution, randomness, seed, max_iter)
 
 
 def binary_search_rust_resolution(
@@ -176,6 +201,18 @@ def main():
         default="leidenalg",
         help="Scanpy Leiden backend",
     )
+    ap.add_argument(
+        "--rust-timing-repeats",
+        type=int,
+        default=7,
+        help="Median Rust timing uses this many runs of the final clustering (after resolution search)",
+    )
+    ap.add_argument(
+        "--scanpy-timing-repeats",
+        type=int,
+        default=7,
+        help="Median Scanpy timing uses this many runs",
+    )
     args = ap.parse_args()
 
     sc.settings.verbosity = 1
@@ -188,12 +225,15 @@ def main():
     g = csr_upper_triangle(conn)
     n_nodes = adata.n_obs
 
-    t0 = time.perf_counter()
-    kw = dict(resolution=args.resolution, key_added="leiden_scanpy", flavor=args.flavor)
-    if args.flavor == "igraph":
-        kw["n_iterations"] = 2
-    sc.tl.leiden(adata, **kw)
-    t_scanpy = time.perf_counter() - t0
+    scanpy_times = []
+    for _ in range(max(1, args.scanpy_timing_repeats)):
+        t0 = time.perf_counter()
+        kw = dict(resolution=args.resolution, key_added="leiden_scanpy", flavor=args.flavor)
+        if args.flavor == "igraph":
+            kw["n_iterations"] = 2
+        sc.tl.leiden(adata, **kw)
+        scanpy_times.append(time.perf_counter() - t0)
+    t_scanpy = float(np.median(np.array(scanpy_times, dtype=np.float64)))
 
     k_target = int(adata.obs["leiden_scanpy"].astype("category").cat.categories.size)
 
@@ -238,20 +278,25 @@ def main():
             )
 
         lab_rust = td / "labels_rust_final.npy"
-        t0 = time.perf_counter()
-        run_rust_leiden(
-            exe,
-            td / "indptr.npy",
-            td / "indices.npy",
-            td / "data.npy",
-            n_nodes,
-            r_rust,
-            args.randomness,
-            args.seed,
-            args.max_iter,
-            lab_rust,
-        )
-        t_rust = time.perf_counter() - t0
+        rust_times = []
+        n_rep = max(1, args.rust_timing_repeats)
+        for rep in range(n_rep):
+            t0 = time.perf_counter()
+            run_rust_leiden(
+                exe,
+                td / "indptr.npy",
+                td / "indices.npy",
+                td / "data.npy",
+                n_nodes,
+                r_rust,
+                args.randomness,
+                args.seed,
+                args.max_iter,
+                lab_rust,
+                probe_count_only=False,
+            )
+            rust_times.append(time.perf_counter() - t0)
+        t_rust = float(np.median(np.array(rust_times, dtype=np.float64)))
         labels_rust = np.load(lab_rust)
 
     leid = adata.obs["leiden_scanpy"].astype("category")
@@ -280,7 +325,7 @@ def main():
     axes[0].set_ylabel("UMAP2")
     fig.suptitle(
         "PBMC3k processed | k_scanpy={} k_rust={} | ARI={:.3f} NMI={:.3f} | "
-        "time: Scanpy {:.3f}s vs Rust {:.3f}s".format(
+        "median time: Scanpy {:.4f}s vs Rust {:.4f}s".format(
             k_target, k_rust, ari, nmi, t_scanpy, t_rust
         )
     )
@@ -292,8 +337,12 @@ def main():
         n_nodes, g.nnz, args.resolution
     ))
     print("  Rust CPM resolution used: {:.8g} (Scanpy res stays {:.4g})".format(r_rust, args.resolution))
-    print("  Scanpy Leiden wall time: {:.6f} s".format(t_scanpy))
-    print("  Rust Leiden wall time:   {:.6f} s".format(t_rust))
+    print("  Scanpy Leiden median wall time: {:.6f} s ({} runs)".format(
+        t_scanpy, max(1, args.scanpy_timing_repeats)
+    ))
+    print("  Rust Leiden median wall time:   {:.6f} s ({} runs)".format(
+        t_rust, max(1, args.rust_timing_repeats)
+    ))
     print("  Clusters: Scanpy {} | Rust {}".format(k_target, k_rust))
     print("  Adjusted Rand Index:     {:.6f}".format(ari))
     print("  NMI:                     {:.6f}".format(nmi))

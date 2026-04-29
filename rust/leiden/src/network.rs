@@ -1,8 +1,8 @@
 use crate::graph::{Edges, UnGraph};
 use crate::Clustering;
+use fxhash::FxHashMap;
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator};
 use rayon::slice::ParallelSlice;
-use std::collections::HashMap;
 
 /// Undirected graph with f32 node weights and f32 edge weights. Used to represent the network being clustered.
 pub type Graph = UnGraph<f32, f32, u32>;
@@ -145,7 +145,9 @@ impl Network {
             *cluster_node_weight += self.graph.node_weight(n).unwrap();
         }
 
-        let mut edge_memo = HashMap::new();
+        let est_pairs = (self.graph.edge_count() / 2).max(clustering.num_clusters());
+        let mut edge_memo: FxHashMap<(u32, u32), f32> = FxHashMap::default();
+        edge_memo.reserve(est_pairs);
 
         for e in self.graph.edge_references() {
             let c1 = clustering.get(e.source().index() as usize) as u32;

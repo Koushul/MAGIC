@@ -8,7 +8,7 @@ fn usage() -> ! {
     eprintln!(
         "Usage: leiden-from-csr --indptr P --indices P --data P --shape N \\
           [--resolution R] [--randomness R] [--seed N] [--max-iter I] \\
-          --out-labels P.npy"
+          [--probe-count-only] [--out-labels P.npy]"
     );
     std::process::exit(2);
 }
@@ -27,6 +27,8 @@ fn load_f64(path: &Path) -> Array1<f64> {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    let probe_only = args.iter().any(|a| a == "--probe-count-only");
+
     let mut indptr_p: Option<String> = None;
     let mut indices_p: Option<String> = None;
     let mut data_p: Option<String> = None;
@@ -88,6 +90,9 @@ fn main() {
                 out_p = Some(args.get(i + 1).cloned().unwrap_or_default());
                 i += 2;
             }
+            "--probe-count-only" => {
+                i += 1;
+            }
             _ => {
                 eprintln!("Unknown arg: {}", args[i]);
                 usage();
@@ -98,7 +103,12 @@ fn main() {
     let indptr_p = indptr_p.as_ref().map(Path::new).expect("need --indptr");
     let indices_p = indices_p.as_ref().map(Path::new).expect("need --indices");
     let data_p = data_p.as_ref().map(Path::new).expect("need --data");
-    let out_labels = out_p.as_ref().map(Path::new).expect("need --out-labels");
+    let out_labels = out_p.as_ref().map(Path::new);
+
+    if !probe_only && out_labels.is_none() {
+        eprintln!("need --out-labels");
+        usage();
+    }
 
     if n_nodes == 0 {
         eprintln!("need --shape N");
@@ -144,6 +154,14 @@ fn main() {
     for i in 0..network.nodes() {
         labels.push(clustering.get(i) as i64);
     }
+
+    if probe_only {
+        use std::collections::HashSet;
+        let n = labels.iter().collect::<HashSet<_>>().len();
+        println!("{}", n);
+        return;
+    }
+
     let arr = ndarray::Array1::from_vec(labels);
-    ndarray_npy::write_npy(out_labels, &arr).expect("write labels");
+    ndarray_npy::write_npy(out_labels.unwrap(), &arr).expect("write labels");
 }
