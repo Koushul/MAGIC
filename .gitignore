@@ -34,3 +34,7 @@ matlab/EMT.csv
 
 # Rust
 rust/target
+
+# Large local AnnData snapshots (not tracked)
+data/*.h5ad
+rust/data/*.h5ad

@@ -7,7 +7,12 @@ license = "GPL-2.0-or-later"
 
 [dependencies]
 ndarray = "0.16"
+ndarray-npy = "0.9"
 rayon = "1.10"
+
+[[bin]]
+name = "magic-impute-cli"
+path = "src/bin/magic_impute_cli.rs"
 
 [[bin]]
 name = "compare_magic_timings"
@@ -19,7 +24,6 @@ path = "src/bin/scale_rust.rs"
 
 [dev-dependencies]
 approx = "0.5"
-ndarray-npy = "0.9"
 criterion = "0.5"
 
 [[bench]]
