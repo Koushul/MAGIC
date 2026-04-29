@@ -1,0 +1,20 @@
+[package]
+name = "magic-impute"
+version = "0.1.0"
+edition = "2021"
+description = "Fast parallel MAGIC imputation (sparse diffusion operator × dense expression)"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+ndarray = "0.16"
+rayon = "1.10"
+sprs = "0.11"
+
+[dev-dependencies]
+approx = "0.5"
+ndarray-npy = "0.9"
+criterion = "0.5"
+
+[[bench]]
+name = "magic_bench"
+harness = false
