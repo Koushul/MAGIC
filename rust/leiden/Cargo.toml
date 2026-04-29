@@ -1,0 +1,18 @@
+[package]
+name = "leiden"
+version = "0.1.0"
+authors = ["10x Genomics"]
+license-file = "LICENSE"
+edition = "2021"
+description = "Leiden community detection (vendored from 10XGenomics/scan-rs)"
+repository = "https://github.com/10XGenomics/scan-rs"
+
+[dependencies]
+fxhash = "0.2"
+num-traits = "0.2"
+rand = { version = "0.9", default-features = false, features = ["small_rng"] }
+rayon = "1"
+
+[dev-dependencies]
+flate2 = "1"
+insta = "1"

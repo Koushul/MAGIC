@@ -1,0 +1,15 @@
+[package]
+name = "leiden-tools"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "CLI helpers for scan-rs Leiden (CSR from NumPy)"
+
+[[bin]]
+name = "leiden-from-csr"
+path = "src/main.rs"
+
+[dependencies]
+leiden = { path = "../leiden" }
+ndarray = "0.16"
+ndarray-npy = "0.9"
