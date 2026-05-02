@@ -6,6 +6,10 @@
 # recommended), jsonlite, tidyverse. Plotting packages (ggplot2, ggpmisc, etc.)
 # are only needed if you run plotting sections interactively.
 #
+# On HPC systems, load R with the site module first (names vary; use `module spider R`):
+#   module load R
+#   # or: module load gcc/12 R/4.4.0
+#
 # Example:
 #   Rscript scripts/xenium_cell_type_annotation.R \
 #     --xenium-dir /path/to/Xenium_outs \
